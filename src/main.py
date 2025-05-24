@@ -2,13 +2,20 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from web3 import Web3
+from eth_account import Account
 from web3.types import TxReceipt
 from web3.exceptions import ContractLogicError
 from eth_account.signers.local import LocalAccount
+import sys
+from config import PRIVATE_KEY, get_rpc_url
 import asyncio
 import os
+import secrets
+import sqlite3
 from datetime import datetime
-from src.config import PRIVATE_KEY, get_rpc_url
+
+# Add parent directory to sys.path for config import
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 app = FastAPI(title="Faucet Backend API")
 
@@ -25,10 +32,27 @@ app.add_middleware(
 if not PRIVATE_KEY:
     raise Exception("PRIVATE_KEY not set in environment variables")
 
-# Initialize signer
-signer = Web3(Web3.HTTPProvider("https://rpc.lisk.com")).eth.account.from_key(PRIVATE_KEY)
+# Initialize SQLite database
+DB_NAME = os.path.join(os.path.dirname(os.path.dirname(__file__)), "faucet.db")
 
-# FAUCET_ABI (from your provided code)
+def init_db():
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS secret_codes (
+                faucet_address TEXT PRIMARY KEY,
+                secret_code TEXT NOT NULL,
+                start_time INTEGER NOT NULL,
+                end_time INTEGER NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.commit()
+
+# Initialize database on startup
+init_db()
+
+# FAUCET_ABI
 FAUCET_ABI = [
     {
         "inputs": [
@@ -204,7 +228,7 @@ FAUCET_ABI = [
         "type": "event"
     },
     {
-        "anonymous": False,
+        "anonymous": True,
         "inputs": [
             {
                 "indexed": True,
@@ -558,21 +582,23 @@ FAUCET_ABI = [
 ]
 
 async def get_web3_instance(chain_id: int) -> Web3:
-    """
-    Get Web3 instance for the given chain ID.
-    """
-    rpc_url = get_rpc_url(chain_id)
-    if not rpc_url:
-        raise HTTPException(status_code=400, detail=f"No RPC URL configured for chain {chain_id}")
-    w3 = Web3(Web3.HTTPProvider(rpc_url))
-    if not w3.is_connected():
-        raise HTTPException(status_code=500, detail=f"Failed to connect to node for chain {chain_id}: {rpc_url}")
-    return w3
+    try:
+        rpc_url = get_rpc_url(chain_id)
+        if not rpc_url:
+            print(f"No RPC URL configured for chain {chain_id}")
+            raise HTTPException(status_code=400, detail=f"No RPC URL configured for chain {chain_id}")
+        
+        w3 = Web3(Web3.HTTPProvider(rpc_url))
+        if not w3.is_connected():
+            print(f"Failed to connect to {rpc_url}")
+            raise HTTPException(status_code=500, detail=f"Failed to connect to node for chain {chain_id}: {rpc_url}")
+        
+        return w3
+    except Exception as e:
+        print(f"Error initializing Web3 for chain {chain_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to initialize Web3 for chain {chain_id}: {str(e)}")
 
 async def wait_for_transaction_receipt(w3: Web3, tx_hash: str, timeout: int = 300) -> TxReceipt:
-    """
-    Wait for a transaction receipt with extended timeout.
-    """
     deadline = asyncio.get_event_loop().time() + timeout
     while asyncio.get_event_loop().time() < deadline:
         try:
@@ -585,9 +611,6 @@ async def wait_for_transaction_receipt(w3: Web3, tx_hash: str, timeout: int = 30
     raise TimeoutError(f"Transaction {tx_hash} not mined within {timeout} seconds")
 
 async def check_whitelist_status(w3: Web3, faucet_address: str, user_address: str) -> bool:
-    """
-    Check if a user is whitelisted with retries.
-    """
     faucet_contract = w3.eth.contract(address=faucet_address, abi=FAUCET_ABI)
     for _ in range(5):
         try:
@@ -603,9 +626,6 @@ async def whitelist_user(
     faucet_address: str, 
     user_address: str
 ) -> str:
-    """
-    Whitelist a user for the faucet.
-    """
     try:
         faucet_contract = w3.eth.contract(address=faucet_address, abi=FAUCET_ABI)
         supports_eip1559 = False
@@ -634,9 +654,8 @@ async def whitelist_user(
         else:
             tx_params['gasPrice'] = w3.eth.gas_price
         
-        # Check signer balance
         balance = w3.eth.get_balance(signer.address)
-        if balance < 6250200000000000:  # Minimum gas cost from error
+        if balance < 6250200000000000:
             raise Exception(f"Insufficient funds in signer account {signer.address}: balance {w3.from_wei(balance, 'ether')} CELO, required ~0.00625 CELO")
         
         tx = faucet_contract.functions.setWhitelist(user_address, True).build_transaction(tx_params)
@@ -651,43 +670,79 @@ async def whitelist_user(
         print(f"ERROR in whitelist_user: {str(e)}")
         raise
 
-async def claim_tokens(
-    w3: Web3, 
-    signer: LocalAccount, 
-    faucet_address: str, 
-    user_address: str
-) -> str:
-    """
-    Claim tokens from the faucet on behalf of a user.
-    """
+async def generate_secret_code() -> str:
+    """Generate a 6-character alphanumeric secret code."""
+    characters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    return ''.join(secrets.choice(characters) for _ in range(6))
+
+async def store_secret_code(faucet_address: str, secret_code: str, start_time: int, end_time: int):
+    """Store the secret code in the database."""
     try:
+        with sqlite3.connect(DB_NAME) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT OR REPLACE INTO secret_codes (faucet_address, secret_code, start_time, end_time)
+                VALUES (?, ?, ?, ?)
+            """, (faucet_address, secret_code, start_time, end_time))
+            conn.commit()
+    except sqlite3.Error as e:
+        print(f"Database error in store_secret_code: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+async def verify_secret_code(faucet_address: str, secret_code: str) -> bool:
+    """Verify the secret code against the database."""
+    try:
+        with sqlite3.connect(DB_NAME) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT secret_code, start_time, end_time
+                FROM secret_codes
+                WHERE faucet_address = ?
+            """, (faucet_address,))
+            result = cursor.fetchone()
+            if not result:
+                return False
+            stored_code, start_time, end_time = result
+            current_time = int(datetime.now().timestamp())
+            return (
+                stored_code == secret_code
+                and start_time <= current_time <= end_time
+            )
+    except sqlite3.Error as e:
+        print(f"Database error in verify_secret_code: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+async def set_claim_parameters(
+    faucet_address: str,
+    start_time: int,
+    end_time: int
+) -> str:
+    try:
+        # Generate and store secret code
+        secret_code = await generate_secret_code()
+        await store_secret_code(faucet_address, secret_code, start_time, end_time)
+        print(f"Generated secret code for {faucet_address}: {secret_code}")
+        return secret_code
+    except Exception as e:
+        print(f"ERROR in set_claim_parameters: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to generate secret code: {str(e)}")
+
+async def claim_tokens(
+    w3: Web3,
+    signer: LocalAccount,
+    faucet_address: str,
+    user_address: str,
+    secret_code: str
+) -> str:
+    try:
+        # Verify the secret code
+        is_valid_code = await verify_secret_code(faucet_address, secret_code)
+        if not is_valid_code:
+            print(f"Invalid or expired secret code for faucet {faucet_address}")
+            raise HTTPException(status_code=403, detail="Invalid or expired secret code")
+
         faucet_contract = w3.eth.contract(address=faucet_address, abi=FAUCET_ABI)
         
-        # Check contract state
-        start_time = faucet_contract.functions.startTime().call()
-        end_time = faucet_contract.functions.endTime().call()
-        claim_amount = faucet_contract.functions.claimAmount().call()
-        has_claimed = faucet_contract.functions.hasClaimed(user_address).call()
-        is_ether = faucet_contract.functions.token().call() == "0x0000000000000000000000000000000000000000"
-        balance = w3.eth.get_balance(faucet_address) if is_ether else faucet_contract.functions.getFaucetBalance().call()[0]
-
-        current_time = int(datetime.now().timestamp())
-        if current_time < start_time:
-            raise HTTPException(status_code=400, detail=f"Claim period not started: starts at {start_time}")
-        if current_time > end_time:
-            raise HTTPException(status_code=400, detail=f"Claim period ended: ended at {end_time}")
-        if claim_amount == 0:
-            raise HTTPException(status_code=400, detail="Claim amount not set")
-        if has_claimed:
-            raise HTTPException(status_code=400, detail="User has already claimed")
-        if balance < claim_amount:
-            raise HTTPException(status_code=400, detail=f"Insufficient faucet balance: {balance} available, {claim_amount} needed")
-
-        # Check if user is a contract
-        code = w3.eth.get_code(user_address)
-        if len(code) > 0:
-            print(f"Warning: User {user_address} is a contract. Ensure it can receive Ether.")
-
         supports_eip1559 = False
         try:
             latest_block = w3.eth.get_block('latest')
@@ -697,10 +752,12 @@ async def claim_tokens(
         
         tx_params = {
             'from': signer.address,
-            'gas': 300000,
-            'nonce': w3.eth.get_transaction_count(signer.address),
-            'chainId': w3.eth.chain_id
+            'chainId': w3.eth.chain_id,
+            'nonce': w3.eth.get_transaction_count(signer.address, 'pending'),
         }
+        
+        tx = faucet_contract.functions.claim([user_address]).build_transaction(tx_params)
+        tx_params['gas'] = w3.eth.estimate_gas(tx)
         
         if supports_eip1559:
             base_fee = latest_block.get('baseFeePerGas', 0)
@@ -714,29 +771,81 @@ async def claim_tokens(
         else:
             tx_params['gasPrice'] = w3.eth.gas_price
         
-        tx = faucet_contract.functions.claim([user_address]).build_transaction(tx_params)
+        balance = w3.eth.get_balance(signer.address)
+        if balance < 6250200000000000:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Insufficient funds in signer account {signer.address}: balance {w3.from_wei(balance, 'ether')} CELO, required ~0.00625 CELO"
+            )
+        
         signed_tx = w3.eth.account.sign_transaction(tx, signer.key)
         tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
         receipt = await wait_for_transaction_receipt(w3, tx_hash.hex())
         
         if receipt.get('status', 0) != 1:
-            raise Exception(f"Transaction failed: {tx_hash.hex()}")
+            try:
+                w3.eth.call(tx, block_identifier=receipt['blockNumber'])
+            except Exception as revert_error:
+                raise HTTPException(status_code=400, detail=f"Claim failed: {str(revert_error)}")
+        
         return tx_hash.hex()
     except HTTPException as e:
         raise e
     except Exception as e:
         print(f"ERROR in claim_tokens: {str(e)}")
-        raise
+        raise HTTPException(status_code=500, detail=f"Failed to claim tokens: {str(e)}")
 
 class ClaimRequest(BaseModel):
     userAddress: str
     faucetAddress: str
+    secretCode: str
     shouldWhitelist: bool = True
+    chainId: int
+
+class SetClaimParametersRequest(BaseModel):
+    faucetAddress: str
+    claimAmount: int
+    startTime: int
+    endTime: int
     chainId: int
 
 @app.get("/health")
 async def health_check():
     return {"status": "ok", "timestamp": datetime.utcnow().isoformat()}
+
+@app.post("/set-claim-parameters")
+async def set_claim_parameters_endpoint(request: SetClaimParametersRequest):
+    try:
+        print(f"Received set claim parameters request: {request.dict()}")
+        
+        # Validate faucet address format
+        if not Web3.is_address(request.faucetAddress):
+            print(f"Invalid faucetAddress: {request.faucetAddress}")
+            raise HTTPException(status_code=400, detail=f"Invalid faucetAddress: {request.faucetAddress}")
+        
+        # Validate chainId
+        valid_chain_ids = [1135, 42220, 42161]
+        if request.chainId not in valid_chain_ids:
+            print(f"Invalid chainId: {request.chainId}")
+            raise HTTPException(status_code=400, detail=f"Invalid chainId: {request.chainId}. Must be one of {valid_chain_ids}")
+        
+        # Convert to checksum address
+        faucet_address = Web3.to_checksum_address(request.faucetAddress)
+        
+        # Generate secret code without calling the smart contract
+        secret_code = await set_claim_parameters(
+            faucet_address,
+            request.startTime,
+            request.endTime
+        )
+        
+        print(f"Generated secret code for {faucet_address}: {secret_code}")
+        return {"success": True, "secretCode": secret_code}
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        print(f"Server error in set_claim_parameters: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/claim")
 async def claim(request: ClaimRequest):
@@ -744,8 +853,8 @@ async def claim(request: ClaimRequest):
         print(f"Received claim request: {request.dict()}")
         
         w3 = await get_web3_instance(request.chainId)
+        signer = w3.eth.account.from_key(PRIVATE_KEY)
         
-        # Validate addresses
         try:
             user_address = w3.to_checksum_address(request.userAddress)
         except ValueError:
@@ -757,7 +866,6 @@ async def claim(request: ClaimRequest):
             print(f"Invalid faucetAddress: {request.faucetAddress}")
             raise HTTPException(status_code=400, detail=f"Invalid faucetAddress: {request.faucetAddress}")
         
-        # Validate chainId
         valid_chain_ids = [1135, 42220, 42161]
         if request.chainId not in valid_chain_ids:
             print(f"Invalid chainId: {request.chainId}")
@@ -795,33 +903,36 @@ async def claim(request: ClaimRequest):
             print(f"Error checking whitelist status: {str(e)}")
             raise HTTPException(status_code=500, detail=f"Error checking whitelist status: {str(e)}")
 
-        print(f"Attempting to claim tokens for {user_address}")
-        tx_hash = await claim_tokens(w3, signer, faucet_address, user_address)
+        print(f"Attempting to claim tokens for {user_address} with secret code")
+        tx_hash = await claim_tokens(w3, signer, faucet_address, user_address, request.secretCode)
         print(f"Claimed tokens for {user_address}, tx: {tx_hash}")
         return {"success": True, "txHash": tx_hash, "whitelistTx": whitelist_tx}
     except HTTPException as e:
         raise e
     except Exception as e:
-        # Attempt to get revert reason
-        try:
-            receipt = w3.eth.get_transaction_receipt("0xa0b938ef60825b2ed866f71459605253169df213de37a2d344faa9c9d4055fcc")
-            if receipt.get('status', 0) == 0:
-                # Simulate transaction to get revert reason
-                faucet_contract = w3.eth.contract(address=faucet_address, abi=FAUCET_ABI)
-                tx_params = {
-                    'from': signer.address,
-                    'to': faucet_address,
-                    'data': faucet_contract.functions.claim([user_address]).encodeABI()
-                }
-                try:
-                    w3.eth.call(tx_params)
-                except ContractLogicError as cle:
-                    print(f"Revert reason: {str(cle)}")
-                    raise HTTPException(status_code=400, detail=f"Claim failed: {str(cle)}")
-        except Exception as re:
-            print(f"Failed to retrieve revert reason: {str(re)}")
         print(f"Server error for user {request.userAddress}: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/secret-codes")
+async def get_secret_codes():
+    try:
+        with sqlite3.connect(DB_NAME) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT faucet_address, secret_code, start_time, end_time, created_at FROM secret_codes")
+            rows = cursor.fetchall()
+            return [
+                {
+                    "faucetAddress": row[0],
+                    "secretCode": row[1],
+                    "startTime": row[2],
+                    "endTime": row[3],
+                    "createdAt": row[4]
+                }
+                for row in rows
+            ]
+    except sqlite3.Error as e:
+        print(f"Database error in get_secret_codes: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn
